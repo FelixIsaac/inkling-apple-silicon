@@ -10,6 +10,7 @@ if [ ! -d "$src" ]; then
     curl -fsSL --retry 3 "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/$revision" -o "$root/build/source.tar.gz"
     tar -xzf "$root/build/source.tar.gz" -C "$src" --strip-components 1
     patch -d "$src" -p1 < "$root/patches/inkling-apple-silicon.patch"
+    patch -d "$src" -p1 < "$root/patches/inkling-m5-extras.patch"
 fi
 cmake -S "$src" -B "$root/build/cmake" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL_EMBED_LIBRARY=ON \

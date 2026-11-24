@@ -109,6 +109,23 @@ GGUF_PY=build/source/gguf-py python3 scripts/tie64.py weights/Inkling-2-Mini-pur
 
 `env.sh` enables the 64-wide path only when `INKLING_MODEL` names a `tie64` file (`serve.sh` sets it). On an untied file it must stay off.
 
+### Folded expert scales, split controllers, SiTU inside the int8 quantiser (M5, +16% prefill)
+
+Three more changes on top of the full M5 stack (`patches/inkling-m5-extras.patch`, applied by `build.sh`):
+
+- `scripts/fold_scales.py` folds the per-expert `ffn_{gate_up,down}_exps.scale` tensors, which the NVFP4 checkpoint leaves behind, into the fp16 block scales of the 4-bit expert weights. It then drops them, which removes two MUL passes over every expert output.
+- `INKLING_SPLIT_CTRL` computes `concat(a, b) @ W` as `W[:, :n] a + W[:, n:] b`, so the 4,608-wide concat is never built.
+- `INKLING_SITU_A8` computes SiTU inside the int8 quantiser of the expert down-projection, so its f32 output is never written or read back. The output is bit-identical to the unfused path.
+
+On an M5 MacBook Air (24 GB), alternating arms with cool-downs: prefill at 2,048 tokens goes from **582 to 675 tok/s**, and decode is unchanged (31.7 → 32.0). Agreement with the unfolded file is 98.9% (mean KLD 0.0010), all of it from fp16 rounding in the fold ([details](results/2026-11-25-fold-split-situ.md)).
+
+```sh
+GGUF_PY=build/source/gguf-py python3 scripts/fold_scales.py weights/Inkling-2-Mini-pure-Q4-tie64.gguf weights/Inkling-2-Mini-pure-Q4-tie64-fold.gguf
+./serve.sh weights/Inkling-2-Mini-pure-Q4-tie64-fold.gguf
+```
+
+**unsloth's `UD-Q4_K_M` keeps 40 expert tensors in NVFP4.** This llama.cpp revision has no Metal path for them, so they run on the CPU: about 23 prefill and 10 decode on the Air. Convert the file first: `make-pure-q4.sh`'s `llama-quantize --allow-requantize` line works directly on it, then run `ctrl_f16.py`, `tie64.py` and `fold_scales.py`.
+
 ## What didn't work
 
 - **Double-buffered weight loading in the int8 kernels** (`INKLING_W4A8_PIPE`): 17% slower; the extra threadgroup memory cuts how many work-groups fit per GPU core.
@@ -156,11 +173,16 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 | `INKLING_OP_PROFILE=2` | Time every kernel group in prefill-sized graphs and print a ranked table | diagnostics |
 | `INKLING_ORDER` | Emits independent kernels (q/k/v controllers, norms, projections) next to each other so they share barriers; bit-identical output, +5% decode on M3 Ultra | both |
 | `INKLING_METAL_TIMING` | Print nodes, encode time and GPU time per graph | diagnostics |
+| `INKLING_SPLIT_CTRL` | Loop-controller down-projection as two half-width matmuls instead of concat + matmul | both |
+| `INKLING_SITU_A8` | M5, `tie64` files: SiTU computed in the int8 quantiser of the expert down-projection; bit-identical | prefill |
+| `INKLING_OP_PROFILE_NAMES` | With `OP_PROFILE`, key non-matmul ops by tensor name | diagnostics |
 | Others in the patch (`W4A8_PIPE`, `NAX_TILE`, `ROUTE_MAP`, `PAIRED_GATES`, …) | Experiments kept for reproducibility; no gain measured | — |
 
 ## Repository
 
 - `patches/inkling-apple-silicon.patch`: the complete change against `ggml-org/llama.cpp@0a9105de42d2c3e3cbc72cb1f398c743ada4f342`
+- `patches/inkling-m5-extras.patch`: split controllers and SiTU-in-quantiser, applied on top by `build.sh`
+- `scripts/fold_scales.py`: folds per-expert output scales into the 4-bit block scales
 - `bench/decode_bench.cpp`: the matmul-only decode token
 - `bench/score_tokens.cpp`, `scripts/compare_tokens.py`: next-token agreement and NLL between two builds or files
 - `bench/corpus/gsm8k-sample.txt`: scoring corpus, a sample from [GSM8K](https://github.com/openai/grade-school-math) (MIT)

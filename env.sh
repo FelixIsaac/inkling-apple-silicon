@@ -9,3 +9,6 @@ if [ "$(sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -c -E 'M5')" = 1 ]
         *tie64*) export INKLING_W4A8_G64=1 INKLING_W4A8_T64=1 INKLING_W4A8_ADAPT=1 ;;
     esac
 fi
+# inkling-m5-extras.patch: split loop-controller matmul (no concat); SiTU computed inside the int8 down-proj quantiser
+export INKLING_SPLIT_CTRL=1
+case "${INKLING_MODEL:-}" in *tie64*) export INKLING_SITU_A8=1 ;; esac

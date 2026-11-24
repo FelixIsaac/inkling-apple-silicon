@@ -1,0 +1,216 @@
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2780,6 +2780,15 @@
+         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+         cb(experts, "ffn_moe_down", il);
+ 
++        // INKLING_SITU_A8: the Metal backend may quantise straight from the SiTU inputs inside this matmul,
++        // so list them as extra sources: they stay allocated until it runs and barriers see the dependency.
++        static const bool situ_a8 = std::getenv("INKLING_SITU_A8") != nullptr;
++        if (situ_a8 && experts->op == GGML_OP_MUL_MAT_ID && experts->src[1] == cur && ggml_is_inkling_situ(cur) &&
++            experts->src[3] == nullptr && experts->src[4] == nullptr) {
++            experts->src[3] = cur->src[0];
++            experts->src[4] = cur->src[1];
++        }
++
+         if (amax_src1.scale_s) {
+             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
+         }
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -477,8 +477,21 @@
+             }
+         }
+     }
+-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+-    gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
++    ggml_tensor * gate;
++    ggml_tensor * wdown = loop.ctrl_down[ctrl];
++    static const bool split_ctrl = std::getenv("INKLING_SPLIT_CTRL") != nullptr;
++    if (split_ctrl && wdown->ne[0] == 2 * cur->ne[0] && ggml_are_same_shape(cur, message) &&
++        wdown->ne[2] == 1 && wdown->ne[3] == 1 && !ggml_is_quantized(wdown->type)) {
++        // concat(a, b) @ W == W[:, :n] a + W[:, n:] b: skip materialising the 2n-wide concat
++        const int64_t n = cur->ne[0];
++        ggml_tensor * wa = ggml_view_2d(ctx0, wdown, n, wdown->ne[1], wdown->nb[1], 0);
++        ggml_tensor * wb = ggml_view_2d(ctx0, wdown, n, wdown->ne[1], wdown->nb[1], n * ggml_element_size(wdown));
++        gate = ggml_add(ctx0, ggml_mul_mat(ctx0, wa, ggml_rms_norm(ctx0, cur, 1e-6f)),
++                              ggml_mul_mat(ctx0, wb, ggml_rms_norm(ctx0, message, 1e-6f)));
++    } else {
++        gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
++        gate = build_lora_mm(wdown, gate);
++    }
+ 
+     ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl], gate);
+     ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -77,6 +77,8 @@
+         return idxs.size();
+     }
+ 
++    const ggml_cgraph * graph() const { return gf; }
++
+     ggml_tensor * node(int i) const {
+         assert(i >= 0 && i < (int) idxs.size());
+         return ggml_graph_node(gf, idxs[i]);
+@@ -185,6 +187,28 @@
+     return ggml_mem_ranges_add(ctx->mem_ranges, node);
+ }
+ 
++// INKLING_SITU_A8: a SiTU node whose only consumer is an int8 (W4A8, 64-wide) expert matmul is not run;
++// the consumer quantises straight from the SiTU inputs. Both sites use this predicate, so they agree.
++static bool inkling_situ_a8_fusable(const ggml_cgraph * gf, const ggml_tensor * situ, bool has_tensor) {
++    static const bool on = std::getenv("INKLING_SITU_A8") != nullptr && std::getenv("INKLING_W4A8_G64") != nullptr;
++    if (!on || !has_tensor || !situ || !ggml_is_inkling_situ(situ) || situ->ne[3] != 1 ||
++        (situ->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    const ggml_tensor * consumer = nullptr;
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        const ggml_tensor * n = gf->nodes[i];
++        if (n->view_src == situ) return false;
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (n->src[s] != situ) continue;
++            if (s != 1 || n->op != GGML_OP_MUL_MAT_ID || (consumer && consumer != n)) return false;
++            consumer = n;
++        }
++    }
++    return consumer && consumer->src[0]->ne[0] == situ->ne[0] && situ->ne[0] % 64 == 0 &&
++           ggml_metal_op_inkling_w4a8(consumer) >= 0;
++}
++
+ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     struct ggml_tensor * node = ctx->node(idx);
+ 
+@@ -463,6 +487,10 @@
+                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(out), 3);
+                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (shape[1] + 3) / 4, 1, 1, 128, 1, 1);
+                     n_fuse = 1;
++                    break;
++                }
++                if (!std::getenv("INKLING_SITU_A8_KEEP") && inkling_situ_a8_fusable(ctx->graph(), out, ggml_metal_device_get_props(ctx->dev)->has_tensor)) {
++                    n_fuse = 1;  // computed inside the consumer's int8 quantisation
+                     break;
+                 }
+                 if (ggml_is_inkling_situ(out)) {
+@@ -2930,6 +2958,38 @@
+     ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+     ggml_metal_encoder_set_buffer  (ctx->enc, bid_qa, 2);
+     const int n = a8.nrows * (a8.K / (g64 ? 64 : 32));
++    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
++}
++
++static void inkling_a8_quant_situ(ggml_metal_op_t ctx, const ggml_tensor * op, const ggml_metal_kargs_inkling_a8 & a8, ggml_metal_buffer_id bid_qa) {
++    const ggml_tensor * situ = op->src[1];
++    // the skipped SiTU node never registered its inputs' producers: wait for them explicitly
++    ggml_metal_op_concurrency_reset(ctx);
++    const char * qn = "kernel_inkling_quant_a8g64_situ";
++    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, qn);
++    if (!pipeline.pipeline) pipeline = ggml_metal_library_compile_pipeline(ctx->lib, qn, qn, nullptr);
++    uint64_t strides[6];
++    for (int i = 0; i < 6; ++i) strides[i] = situ->src[i / 3]->nb[1 + i % 3] / 16;
++    float params[4];
++    memcpy(&params[0], situ->op_params + GGML_INKLING_TAG_SLOT - 2, sizeof(float));
++    memcpy(&params[1], situ->op_params + GGML_INKLING_TAG_SLOT - 3, sizeof(float));
++    params[2] = 1.0f / params[0];
++    params[3] = params[1] > 0 ? 1.0f / params[1] : 0;
++    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
++    ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &a8, sizeof(a8), 0);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(situ->src[0]), 1);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(situ->src[1]), 2);
++    ggml_metal_encoder_set_buffer  (ctx->enc, bid_qa, 3);
++    ggml_metal_encoder_set_bytes   (ctx->enc, strides, sizeof(strides), 4);
++    const int mode = std::getenv("INKLING_SITU_A8_DBG") ? 1 : 0;
++    if (mode == 1) {
++        for (int i = 3; i < 6; ++i) strides[i] = situ->nb[1 + i % 3] / 16;
++        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(situ), 2);
++        ggml_metal_encoder_set_bytes (ctx->enc, strides, sizeof(strides), 4);
++    }
++    ggml_metal_encoder_set_bytes   (ctx->enc, params, sizeof(params), 5);
++    ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &mode, sizeof(mode), 6);
++    const int n = a8.nrows * (a8.K / 64) * 16;
+     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
+ }
+ 
+@@ -3269,7 +3329,11 @@
+         ggml_metal_kargs_inkling_a8 a8 = {};
+         if (w4a8 >= 0) {
+             a8 = inkling_a8_args(op, bid_qa);
+-            inkling_a8_quant(ctx, op, a8, bid_qa);
++            if (inkling_situ_a8_fusable(ctx->graph(), op->src[1], props_dev->has_tensor)) {
++                inkling_a8_quant_situ(ctx, op, a8, bid_qa);
++            } else {
++                inkling_a8_quant(ctx, op, a8, bid_qa);
++            }
+         }
+ 
+         if (std::getenv("INKLING_ROUTE_MAP") && ne02 == 128 && ne20 == 8 &&
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -540,7 +540,7 @@
+                 if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0])
+                     snprintf(key, sizeof(key), "%s %s %lldx%lld%s", ggml_op_desc(n), ggml_type_name(n->src[0]->type),
+                              (long long) n->src[0]->ne[0], (long long) n->src[0]->ne[1], res > 1 ? " +fused" : "");
+-                else if (n->op == GGML_OP_CUSTOM) {
++                else if (n->op == GGML_OP_CUSTOM || (getenv("INKLING_OP_PROFILE_NAMES") && n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID)) {
+                     char nm[64]; int j = 0;
+                     for (const char * c = n->name; *c && j < 60; ++c) if (!(*c >= '0' && *c <= '9')) nm[j++] = *c;
+                     nm[j] = 0;
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -1733,6 +1733,55 @@
+     ((device float *)(qa + args.off_m))[gid] = d * (float) sum;
+ }
+ 
++// INKLING_SITU_A8: compute the SiTU activation (same arithmetic as kernel_inkling_situ) while quantising
++// it for the int8 expert down projection, so the f32 activation is never written or read back.
++kernel void kernel_inkling_quant_a8g64_situ(
++        constant ggml_metal_kargs_inkling_a8 & args,
++        device const float4 * gates,
++        device const float4 * values,
++        device       char   * qa,
++        constant ulong * stride,
++        constant float * params,
++        constant int & mode,
++        uint tid [[thread_position_in_grid]],
++        ushort lane [[thread_index_in_simdgroup]]) {
++    #pragma clang fp reassociate(off) contract(off)
++    // 16 threads per 64-value group, one float4 each (dispatch is a multiple of 32, rows*G*16 % 16 == 0)
++    const int G = args.K / 64;
++    const int gid = tid / 16;
++    const short j = tid % 16;
++    const bool live = gid < args.nrows * G;
++    const int row = live ? gid / G : 0, g = live ? gid % G : 0;
++    const ulong i1 = row % args.ne11, i2 = row / args.ne11;
++    const ulong col = (ulong) g * 16 + j;
++    float4 v = 0.0f;
++    if (live && mode == 1) {
++        v = values[col + i1*stride[3] + i2*stride[4]];
++    } else if (live) {
++        const float4 gate = gates[col + i1*stride[0] + i2*stride[1]];
++        const float4 value = values[col + i1*stride[3] + i2*stride[4]];
++        volatile thread float4 nonlinear = params[0] * precise::tanh(gate * params[2]);
++        volatile thread float4 sigmoid = 1.0f / (1.0f + exp(-gate));
++        volatile thread float4 limited = params[1] > 0 ? params[1] * precise::tanh(value * params[3]) : value;
++        volatile thread float4 scaled = nonlinear * sigmoid;
++        v = scaled * limited;
++    }
++    const float4 av = abs(v);
++    float amax = max(max(av.x, av.y), max(av.z, av.w));
++    FOR_UNROLL (ushort o = 8; o > 0; o >>= 1) amax = max(amax, simd_shuffle_xor(amax, o));
++    const float d = amax / 127.0f;
++    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
++    const int4 c = clamp(int4(rint(v * id)), -127, 127);
++    int sum = c.x + c.y + c.z + c.w;
++    FOR_UNROLL (ushort o = 8; o > 0; o >>= 1) sum += simd_shuffle_xor(sum, o);
++    if (!live) return;
++    ((device char4 *)(qa + (uint64_t) row * args.K + g * 64))[j] = char4(c);
++    if (j == 0) {
++        ((device float *)(qa + args.off_s))[gid] = d;
++        ((device float *)(qa + args.off_m))[gid] = d * (float) sum;
++    }
++}
++
+ 
+ 
+ template<short TYPE>
