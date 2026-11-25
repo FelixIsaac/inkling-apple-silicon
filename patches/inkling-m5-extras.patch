@@ -16,6 +16,15 @@
          if (amax_src1.scale_s) {
              experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
          }
+@@ -4525,7 +4534,7 @@
+     ggml_set_input(inp->self_rel_pos_swa);
+     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+ 
+-    if (std::getenv("INKLING_REL_FA") && cparams.flash_attn && ubatch.n_tokens >= 32 && ubatch.n_seq_tokens == ubatch.n_tokens) {
++    if (std::getenv("INKLING_REL_FA") && cparams.flash_attn && ubatch.n_tokens >= 128 && ubatch.n_seq_tokens == ubatch.n_tokens) {
+         inp->self_qpos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+         ggml_set_input(inp->self_qpos);
+         ggml_set_name(inp->self_qpos, "attn_inp_qpos");
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
 @@ -477,8 +477,21 @@
