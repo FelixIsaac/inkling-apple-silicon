@@ -15,3 +15,6 @@ case "${INKLING_MODEL:-}" in *tie64*) export INKLING_SITU_A8=1 ;; esac
 # Relative bias inside flash attention instead of a materialised per-head mask: up to 7x smaller compute buffer at long
 # context and +10-30% prefill at 16K depth on the M5 Air; same quality (98.9% top-token vs default on the fold file)
 export INKLING_REL_FA=1
+# Sliding-window KV cache in f16 while the global cache stays quantized (extras patch). Only matters with -ctk/-ctv
+# quantized. 26 Nov, vs f16 KV: K8V4 98.30 -> 99.01% same top (docs), 97.99 -> 98.50% (code); +190 MiB at 192K.
+export INKLING_SWA_KV_F16=1

@@ -51,6 +51,27 @@
  
      ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl], gate);
      ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+--- a/src/llama-kv-cache-iswa.cpp
++++ b/src/llama-kv-cache-iswa.cpp
+@@ -99,8 +99,17 @@
+ 
+     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
+ 
++    // INKLING_SWA_KV_F16: the SWA cache is small (n_swa + n_ubatch cells), so keep it in F16 while the global
++    // cache stays quantized; most attention passes are SWA, so this targets most of the KV quantization error
++    static const bool swa_kv_f16 = std::getenv("INKLING_SWA_KV_F16") != nullptr;
++    const ggml_type type_k_swa = swa_kv_f16 ? GGML_TYPE_F16 : type_k;
++    const ggml_type type_v_swa = swa_kv_f16 ? GGML_TYPE_F16 : type_v;
++    if (swa_kv_f16) {
++        LLAMA_LOG_INFO("%s: INKLING_SWA_KV_F16: SWA cache K/V = f16\n", __func__);
++    }
++
+     kv_swa = std::make_unique<llama_kv_cache>(
+-            model, no_alloc, hparams, type_k, type_v,
++            model, no_alloc, hparams, type_k_swa, type_v_swa,
+             v_trans, offload, unified, size_swa, n_seq_max,
+             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+ }
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -77,6 +77,8 @@
@@ -62,12 +83,10 @@
      ggml_tensor * node(int i) const {
          assert(i >= 0 && i < (int) idxs.size());
          return ggml_graph_node(gf, idxs[i]);
-@@ -183,6 +185,28 @@
-     }
- 
+@@ -185,6 +187,28 @@
      return ggml_mem_ranges_add(ctx->mem_ranges, node);
-+}
-+
+ }
+ 
 +// INKLING_SITU_A8: a SiTU node whose only consumer is an int8 (W4A8, 64-wide) expert matmul is not run;
 +// the consumer quantises straight from the SiTU inputs. Both sites use this predicate, so they agree.
 +static bool inkling_situ_a8_fusable(const ggml_cgraph * gf, const ggml_tensor * situ, bool has_tensor) {
@@ -88,9 +107,11 @@
 +    }
 +    return consumer && consumer->src[0]->ne[0] == situ->ne[0] && situ->ne[0] % 64 == 0 &&
 +           ggml_metal_op_inkling_w4a8(consumer) >= 0;
- }
- 
++}
++
  static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     struct ggml_tensor * node = ctx->node(idx);
+ 
 @@ -463,6 +487,10 @@
                      ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(out), 3);
                      ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (shape[1] + 3) / 4, 1, 1, 128, 1, 1);
@@ -102,10 +123,13 @@
                      break;
                  }
                  if (ggml_is_inkling_situ(out)) {
-@@ -2933,6 +2961,38 @@
-     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
- }
- 
+@@ -2930,6 +2958,38 @@
+     ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+     ggml_metal_encoder_set_buffer  (ctx->enc, bid_qa, 2);
+     const int n = a8.nrows * (a8.K / (g64 ? 64 : 32));
++    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
++}
++
 +static void inkling_a8_quant_situ(ggml_metal_op_t ctx, const ggml_tensor * op, const ggml_metal_kargs_inkling_a8 & a8, ggml_metal_buffer_id bid_qa) {
 +    const ggml_tensor * situ = op->src[1];
 +    // the skipped SiTU node never registered its inputs' producers: wait for them explicitly
@@ -135,12 +159,9 @@
 +    ggml_metal_encoder_set_bytes   (ctx->enc, params, sizeof(params), 5);
 +    ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &mode, sizeof(mode), 6);
 +    const int n = a8.nrows * (a8.K / 64) * 16;
-+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
-+}
-+
- static void inkling_w4a8_mm(ggml_metal_op_t ctx, const ggml_tensor * op, int type, bool id,
-         const ggml_metal_kargs_mul_mm_id & args, const ggml_metal_kargs_inkling_a8 & a8,
-         ggml_metal_buffer_id bid_tpe, ggml_metal_buffer_id bid_ids, ggml_metal_buffer_id bid_qa, int grid_x) {
+     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
+ }
+ 
 @@ -3269,7 +3329,11 @@
          ggml_metal_kargs_inkling_a8 a8 = {};
          if (w4a8 >= 0) {
@@ -224,6 +245,70 @@
              ggml_metal_encoder_set_bytes   (enc, &args_v, sizeof(args_v), 0);
              ggml_metal_encoder_set_buffer  (enc, bid_src2,        1);
              ggml_metal_encoder_set_buffer  (enc, bid_v_f16,       2);
+@@ -4571,6 +4654,20 @@
+             nqptg = cfg.Q;  // = 1
+         }
+ 
++        // INKLING_FA_GQA_ROWS: single-token decode with GQA; the G query heads that share a KV head are presented
++        // to the kernel as G query rows (stride remap only). The kernel already dequantizes each K/V element once and
++        // reuses it for all Q rows, so K/V traffic and dequant work drop from once per query head to once per KV head.
++        static const bool gqa_rows_env = getenv("INKLING_FA_GQA_ROWS") != nullptr;
++        const int64_t gqa_g  = (ne12 > 0 && ne02 % ne12 == 0) ? ne02/ne12 : 1;
++        const int32_t gqa_q  = gqa_g <= 2 ? 2 : 4;
++        const bool gqa_rows = gqa_rows_env && !use_sparse && !has_rows && !has_bias && !has_kvpad &&
++            ne01 == 1 && gqa_g >= 2 && gqa_g <= 4 && (ne32 == 1 || ne32 == ne02) &&
++            (cfg.NE == 1 || cfg.NE == 2 || cfg.NE == 4) &&
++            fa_vec_smem(nsg, gqa_q) <= props_dev->max_theadgroup_memory_size;
++        if (gqa_rows) {
++            nqptg = gqa_q;
++        }
++
+         const int32_t ns10 = nb11_attn/nb10_attn;
+         const int32_t ns20 = nb21_attn/nb20_attn;
+ 
+@@ -4610,7 +4707,23 @@
+             /*.n_kv_max_padded =*/ n_kv_max_padded,
+         };
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
++        if (gqa_rows) {
++            args.ne01 = (int32_t) gqa_g;
++            args.nb01 = nb02;
++            args.ne02 = (int32_t) ne12;
++            args.nb02 = gqa_g*nb02;
++            if (ne32 == ne02) {
++                args.nb31 = nb32;
++                args.ne32 = (int32_t) ne12;
++                args.nb32 = gqa_g*nb32;
++            } else {
++                args.nb31 = 0;
++            }
++        }
++        const int64_t grid_x = gqa_rows ? 1    : (ne01 + nqptg - 1)/nqptg;
++        const int64_t grid_y = gqa_rows ? ne12 : (ne02 + nhptg - 1)/nhptg;
++
++        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, gqa_rows);
+ 
+         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+@@ -4634,7 +4747,7 @@
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, ne03*nwg, 32, nsg, 1);
+         } else {
+             // sanity checks
+             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+@@ -4647,7 +4760,7 @@
+             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, ne03*nwg, 32, nsg, 1);
+ 
+             // sync the 2 kernels
+             ggml_metal_op_concurrency_reset(ctx);
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -540,7 +540,7 @@
@@ -237,7 +322,17 @@
                      nm[j] = 0;
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -2113,7 +2113,10 @@
+@@ -2104,7 +2104,8 @@
+         int32_t nwg,
+         bool    use_kv_f16,
+         int32_t ns10,
+-        int32_t ns20) {
++        int32_t ns20,
++        bool    gqa_rows) {
+     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+ 
+     char base[256];
+@@ -2113,7 +2114,10 @@
      const int32_t dk = (int32_t) op->src[1]->ne[0];
      const int32_t dv = (int32_t) op->src[2]->ne[0];
  
@@ -249,6 +344,45 @@
  
      char qne_suffix[16] = {0};
      if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {
+@@ -2127,7 +2131,7 @@
+             dv,
+             qne_suffix);
+ 
+-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_rows=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
++    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_rows=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_gqar=%d",
+             base,
+             has_mask,
+             has_sinks,
+@@ -2138,7 +2142,8 @@
+             has_rows,
+             ns10,
+             ns20,
+-            nsg, nwg);
++            nsg, nwg,
++            gqa_rows);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -2151,6 +2156,7 @@
+         ggml_metal_cv_set_bool(cv, has_kvpad,  FC_FLASH_ATTN_EXT_VEC + 4);
+         ggml_metal_cv_set_bool(cv, has_sparse, FC_FLASH_ATTN_EXT_VEC + 5);
+         ggml_metal_cv_set_bool(cv, has_rows,   FC_FLASH_ATTN_EXT_VEC + 6);
++        ggml_metal_cv_set_bool(cv, gqa_rows,   FC_FLASH_ATTN_EXT_VEC + 7);
+ 
+         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT_VEC + 20);
+         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -246,7 +246,8 @@
+         int32_t nwg,
+         bool    use_kv_f16,
+         int32_t ns10,
+-        int32_t ns20);
++        int32_t ns20,
++        bool    gqa_rows);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
+         ggml_metal_library_t lib,
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
 @@ -1809,7 +1809,9 @@
@@ -340,3 +474,37 @@
  #undef FA_TYPES
  #undef FA_TYPES_F32
 -
+--- a/ggml/src/ggml-metal/kernels/fa_vec_common.metal
++++ b/ggml/src/ggml-metal/kernels/fa_vec_common.metal
+@@ -14,6 +14,10 @@
+ constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
+ constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
+ constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
++// gqa_rows (INKLING_FA_GQA_ROWS): single-token decode with the G query heads of one KV head presented as G query
++// rows (host remaps strides, no copy). tgpig[1] is then the KV head, row r is query head iq2*G + r, and each K/V
++// element is read and dequantized once for the whole group instead of once per query head.
++constant bool    FC_flash_attn_ext_vec_gqa_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
+ template<
+     typename q4_t,  // query types in shared memory
+     typename k4_t,  // key types in shared memory
+@@ -568,7 +572,8 @@
+         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
+             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                 const float m = M[qq];
+-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
++                const int   hs = FC_flash_attn_ext_vec_gqa_rows ? (iq1*Q + qq < args.ne01 ? iq2*args.ne01 + iq1*Q + qq : -1) : iq2;
++                const float s = (tiisg == 0 && hs >= 0) ? ((device const float *) sinks)[hs] : -FLT_MAX/2;
+ 
+                 M[qq] = simd_max(max(M[qq], s));
+ 
+@@ -643,7 +648,9 @@
+                 continue;
+             }
+ 
+-            const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1_q*args.ne1;
++            const int64_t rid = FC_flash_attn_ext_vec_gqa_rows
++                ? iq3*args.ne2*args.ne1 + (int64_t) iq2*args.ne01 + iq1_q
++                : iq3*args.ne2*args.ne1 + iq2 + iq1_q*args.ne1;
+ 
+             const float Sval = NWG == 1 ? (ss[2*qq + 0] == 0.0f ? 0.0f : 1.0f/ss[2*qq + 0]) : 1.0f;
+ 
