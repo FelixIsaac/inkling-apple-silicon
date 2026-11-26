@@ -126,6 +126,16 @@ GGUF_PY=build/source/gguf-py python3 scripts/fold_scales.py weights/Inkling-2-Mi
 
 **unsloth's `UD-Q4_K_M` keeps 40 expert tensors in NVFP4.** This llama.cpp revision has no Metal path for them, so they run on the CPU: about 23 prefill and 10 decode on the Air. Convert the file first: `make-pure-q4.sh`'s `llama-quantize --allow-requantize` line works directly on it, then run `ctrl_f16.py`, `tie64.py` and `fold_scales.py`.
 
+### Offline coding on 24 GB: `serve-coding.sh` (long context, 26 Nov)
+
+`./serve-coding.sh [CTX] [PORT]` runs the imatrix ctrl16 fold file (97.3% top-token vs the original NVFP4) with:
+
+- `-ctk q8_0 -ctv q4_0` on the Metal GPU (the extras patch fixes two upstream Metal bugs for mixed K/V types) and `INKLING_SWA_KV_F16=1`, which keeps the small sliding-window cache in f16: 99.0% top-token vs f16 KV (98.3% without it), +190 MiB.
+- `-lm none`: weights read into memory instead of mmap'd. 128K decode goes from 10.6 to 15.2 tok/s; mmap'd pages fault under memory pressure.
+- `--spec-type ngram-mod`: +42% decode on code edits, no loss on new code.
+
+Context on the default GPU cap with other apps closed: 196K (K8V4), or 262K with `-ctk q4_0 -ctv q4_0 -ub 512` (98.6% docs / 98.1% code). A needle test at 244K tokens of code found 3 of 3 planted facts; decode there is 11 tok/s and a first fill takes ~25 min. Details: [layer map and results](results/2026-11-26-layer-map.md); next steps: [ROADMAP.md](ROADMAP.md).
+
 ## What didn't work
 
 - **Double-buffered weight loading in the int8 kernels** (`INKLING_W4A8_PIPE`): 17% slower; the extra threadgroup memory cuts how many work-groups fit per GPU core.
@@ -181,7 +191,8 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 ## Repository
 
 - `patches/inkling-apple-silicon.patch`: the complete change against `ggml-org/llama.cpp@0a9105de42d2c3e3cbc72cb1f398c743ada4f342`
-- `patches/inkling-m5-extras.patch`: split controllers and SiTU-in-quantiser, applied on top by `build.sh`
+- `patches/inkling-m5-extras.patch`: split controllers, SiTU-in-quantiser, GPU mixed K/V cache, SWA cache in f16, `REL_FA` short-prompt fix; applied on top by `build.sh`
+- `serve-coding.sh`: long-context coding server; `ROADMAP.md`: status and next steps
 - `scripts/fold_scales.py`: folds per-expert output scales into the 4-bit block scales
 - `bench/decode_bench.cpp`: the matmul-only decode token
 - `bench/score_tokens.cpp`, `scripts/compare_tokens.py`: next-token agreement and NLL between two builds or files
